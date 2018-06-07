@@ -10,8 +10,7 @@ from tqdm import tqdm
 
 import utils
 from data_batcher import SliceBatchGenerator
-from modules import ConvEncoder, DeconvDecoder, UNet
-
+from modules import ConvEncoder, DeconvDecoder, ConvEncoderUNet, DeconvDecoderUNet, ConvEncoderDeepUNet, DeconvDecoderDeepUNet, ConvEncoderShallowUNet, DeconvDecoderShallowUNet
 
 class ATLASModel(object):
   def __init__(self, FLAGS):
@@ -104,17 +103,48 @@ class ATLASModel(object):
     encoder = ConvEncoder(input_shape=self.input_dims,
                           keep_prob=self.keep_prob,
                           scope_name="encoder")
-    encoder_hiddens_op = encoder.build_graph(tf.expand_dims(self.inputs_op, 3))
+    encoder_hiddens_op, cache = encoder.build_graph(tf.expand_dims(self.inputs_op, 3))
     decoder = DeconvDecoder(keep_prob=self.keep_prob,
                             output_shape=self.input_dims,
                             scope_name="decoder")
     # Only squeezes the last dimension (do not squeeze the batch dimension)
-    self.logits_op = tf.squeeze(decoder.build_graph(encoder_hiddens_op), axis=3)
+    self.logits_op = tf.squeeze(decoder.build_graph(encoder_hiddens_op, cache), axis=3)
+    self.predicted_mask_probs_op = self.logits_op
     self.predicted_mask_probs_op = tf.sigmoid(self.logits_op,
-                                              name="predicted_mask_probs")
+                                             name="predicted_mask_probs")
     self.predicted_masks_op = tf.cast(self.predicted_mask_probs_op > 0.5,
                                       dtype=tf.uint8,
                                       name="predicted_masks")
+
+  def compute_loss(self):
+    """
+    Compute Tversky loss
+    loss = p0g0/(p0g0+p0g1+p1g0)
+    """ 
+
+    ALPHA = 0.7
+    BETA = 0.3
+    labels = self.target_masks_op  # g0
+    neg_labels = tf.subtract(tf.ones(tf.shape(labels)), labels)  # g1
+    predictions =  self.predicted_mask_probs_op # self.logits_op #tf.nn.softmax(self.logits_op)  # p0
+    neg_predictions = tf.subtract(tf.ones(tf.shape(predictions)), predictions)  # p1
+
+    p0g0 = tf.reduce_sum(tf.multiply(predictions, labels))
+    p0g1 = tf.reduce_sum(tf.multiply(predictions, neg_labels))
+    p1g0 = tf.reduce_sum(tf.multiply(neg_predictions, labels))
+
+    tversky = tf.truediv(
+      p0g0,
+      tf.add(
+        p0g0,
+        tf.add(
+          tf.scalar_mul(ALPHA, p0g1),
+          tf.scalar_mul(BETA, p1g0)
+        )
+      )
+    )
+    return tf.subtract(tf.ones(tf.shape(tversky)), tversky)
+
 
 
   def add_loss(self):
@@ -128,18 +158,26 @@ class ATLASModel(object):
       and low loss for [0, 1, 0, 1, 1].
     """
     with tf.variable_scope("loss"):
+      
+      #Loss 1
       # sigmoid_ce_with_logits = tf.nn.sigmoid_cross_entropy_with_logits
       # # {loss} is the same shape as {self.logits_op} and {self.target_masks_op}
       # loss = sigmoid_ce_with_logits(logits=self.logits_op,
       #                               labels=self.target_masks_op,
       #                               name="ce")
 
+      #Loss 2
+      #pos_weights > 1 decreases the false negative count, increasing recall. 
+      #pos_weights < 1 decreases the false positive count, increasing precision.
       weighted_ce_with_logits = tf.nn.weighted_cross_entropy_with_logits
       loss = weighted_ce_with_logits(logits=self.logits_op,
                                      targets=self.target_masks_op,
-                                     pos_weight=100.0,
+                                     pos_weight=10.0,
                                      name="ce")
-
+      #Loss 3
+      #Tversky loss
+      #loss = self.compute_loss()  
+    
       self.loss = tf.reduce_mean(loss)  # scalar mean across batch
 
       # Adds a summary to write loss to TensorBoard
@@ -557,16 +595,78 @@ class UNetATLASModel(ATLASModel):
     super().__init__(FLAGS)
 
   def build_graph(self):
+    
     assert(self.input_dims == self.inputs_op.get_shape().as_list()[1:])
-    unet = UNet(input_shape=self.input_dims,
-                keep_prob=self.keep_prob,
-                output_shape=self.input_dims,
-                scope_name="unet")
-    self.logits_op = tf.squeeze(
-      unet.build_graph(tf.expand_dims(self.inputs_op, 3)), axis=3)
-
+    encoder = ConvEncoderUNet(input_shape=self.input_dims,
+                          keep_prob=self.keep_prob,
+                          scope_name="encoder_unet")
+    encoder_hiddens_op, cache = encoder.build_graph(tf.expand_dims(self.inputs_op, 3))
+    decoder = DeconvDecoderUNet(keep_prob=self.keep_prob,
+                            output_shape=self.input_dims,
+                            scope_name="decoder_unet")
+    # Only squeezes the last dimension (do not squeeze the batch dimension)
+    self.logits_op = tf.squeeze(decoder.build_graph(encoder_hiddens_op, cache), axis=3)
+    self.predicted_mask_probs_op = self.logits_op
     self.predicted_mask_probs_op = tf.sigmoid(self.logits_op,
-                                              name="predicted_mask_probs")
+                                             name="predicted_mask_probs")
     self.predicted_masks_op = tf.cast(self.predicted_mask_probs_op > 0.5,
-                                      tf.uint8,
+                                      dtype=tf.uint8,
+                                      name="predicted_masks")
+
+class UNetDeepATLASModel(ATLASModel):
+  def __init__(self, FLAGS):
+    """
+    Initializes the U-Net ATLAS model, which predicts 0 for the entire mask
+    no matter what, which performs well when --use_fake_target_masks.
+    Inputs:
+    - FLAGS: A _FlagValuesWrapper object passed in from main.py.
+    """
+    super().__init__(FLAGS)
+
+  def build_graph(self):
+    
+    assert(self.input_dims == self.inputs_op.get_shape().as_list()[1:])
+    encoder = ConvEncoderDeepUNet(input_shape=self.input_dims,
+                          keep_prob=self.keep_prob,
+                          scope_name="encoder_unet_deep")
+    encoder_hiddens_op, cache = encoder.build_graph(tf.expand_dims(self.inputs_op, 3))
+    decoder = DeconvDecoderDeepUNet(keep_prob=self.keep_prob,
+                            output_shape=self.input_dims,
+                            scope_name="decoder_unet_deep")
+    # Only squeezes the last dimension (do not squeeze the batch dimension)
+    self.logits_op = tf.squeeze(decoder.build_graph(encoder_hiddens_op, cache), axis=3)
+    self.predicted_mask_probs_op = self.logits_op
+    self.predicted_mask_probs_op = tf.sigmoid(self.logits_op,
+                                             name="predicted_mask_probs")
+    self.predicted_masks_op = tf.cast(self.predicted_mask_probs_op > 0.5,
+                                      dtype=tf.uint8,
+                                      name="predicted_masks")
+
+class UNetShallowATLASModel(ATLASModel):
+  def __init__(self, FLAGS):
+    """
+    Initializes the U-Net ATLAS model, which predicts 0 for the entire mask
+    no matter what, which performs well when --use_fake_target_masks.
+    Inputs:
+    - FLAGS: A _FlagValuesWrapper object passed in from main.py.
+    """
+    super().__init__(FLAGS)
+
+  def build_graph(self):
+    
+    assert(self.input_dims == self.inputs_op.get_shape().as_list()[1:])
+    encoder = ConvEncoderShallowUNet(input_shape=self.input_dims,
+                          keep_prob=self.keep_prob,
+                          scope_name="encoder_unet_shallow")
+    encoder_hiddens_op, cache = encoder.build_graph(tf.expand_dims(self.inputs_op, 3))
+    decoder = DeconvDecoderShallowUNet(keep_prob=self.keep_prob,
+                            output_shape=self.input_dims,
+                            scope_name="decoder_unet_shallow")
+    # Only squeezes the last dimension (do not squeeze the batch dimension)
+    self.logits_op = tf.squeeze(decoder.build_graph(encoder_hiddens_op, cache), axis=3)
+    self.predicted_mask_probs_op = self.logits_op
+    self.predicted_mask_probs_op = tf.sigmoid(self.logits_op,
+                                             name="predicted_mask_probs")
+    self.predicted_masks_op = tf.cast(self.predicted_mask_probs_op > 0.5,
+                                      dtype=tf.uint8,
                                       name="predicted_masks")
